@@ -221,3 +221,220 @@ se reinicia al reiniciar el proceso.
 ```bash
 .venv/bin/pytest api_propia/tests -v
 ```
+
+---
+
+# Clasificador de solicitudes con IA (`clasificador_ia/`)
+
+## Documentación funcional
+
+### Qué problema resuelve
+
+Módulo Python desacoplado que recibe el texto libre de una solicitud
+(`asunto` + `descripcion`) y usa la API de Claude para asignar una
+**categoría** y una **prioridad** dentro de la taxonomía de Mesa de Ayuda.
+Es un componente reutilizable, independiente de `api_propia/`: no importa
+sus modelos ni sus rutas, y **no está integrado** con `POST /solicitudes`
+todavía (queda para un spec futuro — ver `specs/02-clasificador-ia-solicitudes.md`).
+
+### Para quién es
+
+Para cualquier flujo (futuro) que necesite clasificar texto libre de una
+solicitud sin tener que implementar su propia lógica de llamada a la IA,
+reintentos o modo degradado.
+
+### Qué NO cubre
+
+- Integración con `POST /solicitudes` u otro endpoint de `api_propia/`.
+- Endpoint HTTP propio para disparar la clasificación bajo demanda.
+- Clasificación heurística (por palabras clave) como paso intermedio antes
+  de degradar.
+- Taxonomía configurable en tiempo de ejecución (está fija en código).
+- Circuit breaker, rate limiting o métricas sobre el uso de la IA.
+
+## Documentación técnica
+
+### Cómo funciona
+
+`clasificar_solicitud(asunto, descripcion)` (en `clasificador_ia/clasificador.py`):
+
+1. Construye el cliente de Anthropic (`clasificador_ia/cliente.py`); si
+   `ANTHROPIC_API_KEY` no está definida en el entorno, lanza
+   `ConfiguracionInvalida` de inmediato (falla explícita, no modo
+   degradado — es un error de despliegue, no una falla transitoria).
+2. Arma un prompt con `asunto` y `descripcion`, y llama al modelo
+   `claude-opus-4-8` con `output_config.format` (`json_schema`, con
+   `categoria` y `prioridad` como `enum` de la taxonomía y
+   `additionalProperties: false`). Esto garantiza por construcción que la
+   IA nunca puede devolver un valor fuera de la taxonomía — no hace falta
+   validar la respuesta después.
+3. Si la llamada falla (timeout de 10s o error del proveedor), reintenta
+   hasta 2 veces más (3 intentos totales) con backoff exponencial (~1s,
+   luego ~2s), logueando cada intento fallido.
+4. Si los 3 intentos fallan, devuelve un resultado en **modo degradado**
+   con valores fijos (`categoria="otro"`, `prioridad="media"`,
+   `origen="degradado"`) sin lanzar excepción al llamador.
+5. Si algún intento tiene éxito, devuelve `ResultadoClasificacion` con
+   `origen="ia"` y la clasificación real.
+
+### Instalación
+
+```bash
+.venv/bin/pip install -r clasificador_ia/requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Uso
+
+```python
+from clasificador_ia.clasificador import clasificar_solicitud
+
+resultado = clasificar_solicitud(
+    "Impresora no enciende",
+    "La impresora del piso 3 no responde",
+)
+# ResultadoClasificacion(categoria="incidente", prioridad="alta", origen="ia")
+```
+
+### Paso a paso para probar lo implementado
+
+**1. Instalar dependencias** (si aún no lo hiciste — usa el mismo `.venv`
+del repo):
+
+```bash
+.venv/bin/pip install -r clasificador_ia/requirements.txt
+```
+
+**2. Correr la suite de pruebas (no necesita `ANTHROPIC_API_KEY` ni red)**
+— es la forma más rápida de verificar que toda la lógica (éxito,
+reintentos, degradado, error de configuración) funciona:
+
+```bash
+.venv/bin/pytest clasificador_ia/tests -v
+```
+
+Salida esperada:
+
+```
+collected 4 items
+
+clasificador_ia/tests/test_clasificador.py::test_clasificacion_exitosa_primer_intento PASSED [ 25%]
+clasificador_ia/tests/test_clasificador.py::test_exito_tras_reintento PASSED [ 50%]
+clasificador_ia/tests/test_clasificador.py::test_agotamiento_reintentos_devuelve_degradado PASSED [ 75%]
+clasificador_ia/tests/test_clasificador.py::test_sin_api_key_lanza_configuracion_invalida PASSED [100%]
+
+============================== 4 passed in 0.43s ===============================
+```
+
+**3. Probar el error de configuración** (sin API key definida, debe
+fallar explícito, no degradar):
+
+```bash
+unset ANTHROPIC_API_KEY
+.venv/bin/python -c "
+from clasificador_ia.clasificador import clasificar_solicitud
+clasificar_solicitud('Impresora no enciende', 'No responde')
+"
+```
+
+Salida esperada: excepción `clasificador_ia.config.ConfiguracionInvalida:
+Falta la variable de entorno ANTHROPIC_API_KEY.`
+
+**4. Probar con una llamada real a la IA** (requiere una API key válida
+de Anthropic — consume créditos):
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+.venv/bin/python -c "
+from clasificador_ia.clasificador import clasificar_solicitud
+
+resultado = clasificar_solicitud(
+    'Impresora no enciende',
+    'La impresora del piso 3 no responde desde esta mañana',
+)
+print(resultado)
+"
+```
+
+Salida esperada (la clasificación exacta puede variar, pero siempre
+dentro de la taxonomía):
+
+```
+ResultadoClasificacion(categoria='incidente', prioridad='alta', origen='ia')
+```
+
+Y por stdout, el log estructurado del evento:
+
+```json
+{"timestamp": "2026-08-24T10:00:00Z", "level": "INFO", "evento": "clasificacion_ia", "origen": "ia", "categoria": "incidente", "prioridad": "alta", "intentos": 1, "duracion_ms": 850.3}
+```
+
+**5. (Opcional) Simular el modo degradado** sin esperar a que la API
+falle de verdad — usando una API key inválida para forzar errores del
+proveedor en los 3 intentos:
+
+```bash
+export ANTHROPIC_API_KEY=clave-invalida
+.venv/bin/python -c "
+from clasificador_ia.clasificador import clasificar_solicitud
+print(clasificar_solicitud('Prueba', None))
+"
+```
+
+Salida esperada tras ~3s de reintentos (backoff ~1s + ~2s):
+
+```
+ResultadoClasificacion(categoria='otro', prioridad='media', origen='degradado')
+```
+
+Con dos logs `clasificacion_ia_reintento` y uno `clasificacion_ia_degradado`
+por stdout.
+
+### Modelo de datos
+
+```python
+CATEGORIAS_VALIDAS = ["incidente", "acceso", "hardware", "software", "otro"]
+PRIORIDADES_VALIDAS = ["baja", "media", "alta", "urgente"]
+
+@dataclass(frozen=True)
+class ResultadoClasificacion:
+    categoria: str    # uno de CATEGORIAS_VALIDAS
+    prioridad: str    # uno de PRIORIDADES_VALIDAS
+    origen: str        # "ia" | "degradado"
+```
+
+### Configuración
+
+Fija en código (`clasificador_ia/config.py`), no en variables de entorno
+— son decisiones de comportamiento del módulo, no de despliegue:
+
+| Constante              | Valor            | Descripción                          |
+| ----------------------- | ---------------- | ------------------------------------- |
+| `MODELO`                | `claude-opus-4-8`| Modelo de Anthropic usado.            |
+| `TIMEOUT_SEGUNDOS`      | `10.0`           | Timeout por llamada a la API.         |
+| `MAX_REINTENTOS`        | `2`              | Reintentos adicionales (3 intentos totales). |
+| `BACKOFF_BASE_SEGUNDOS` | `1.0`            | Base del backoff exponencial (~1s, ~2s). |
+
+La única variable de entorno es `ANTHROPIC_API_KEY` (requerida, sin
+default; su ausencia lanza `ConfiguracionInvalida`).
+
+### Logging
+
+JSON por stdout, misma convención que `api_propia` (logger `clasificador_ia`):
+
+```json
+{"timestamp": "2026-08-24T10:00:00Z", "level": "INFO", "evento": "clasificacion_ia", "origen": "ia", "categoria": "incidente", "prioridad": "alta", "intentos": 1, "duracion_ms": 850.3}
+{"timestamp": "2026-08-24T10:00:05Z", "level": "WARNING", "evento": "clasificacion_ia_reintento", "intento": 1, "motivo": "timeout"}
+{"timestamp": "2026-08-24T10:00:20Z", "level": "WARNING", "evento": "clasificacion_ia_degradado", "intentos": 3, "categoria": "otro", "prioridad": "media"}
+```
+
+### Cómo correr las pruebas
+
+```bash
+.venv/bin/pytest clasificador_ia/tests -v
+```
+
+Las pruebas mockean el cliente de Anthropic: corren sin red y sin
+necesidad de `ANTHROPIC_API_KEY`. Cubren clasificación exitosa, éxito tras
+un reintento, agotamiento de reintentos → degradado, y falta de API key →
+`ConfiguracionInvalida`.
