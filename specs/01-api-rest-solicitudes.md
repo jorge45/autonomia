@@ -1,6 +1,6 @@
 # SPEC 01 — API REST propia de solicitudes
 
-> **Status:** Approved
+> **Status:** Implementado
 > **Depends on:** ninguna
 > **Date:** 2026-08-24
 > **Objective:** Construir un API REST propia con los recursos `solicitudes`, `areas` y `usuarios`, con validación de entrada, códigos de estado correctos, forma uniforme de errores, configuración por variables de entorno, registro estructurado de eventos, ningún secreto en el repositorio, y documentación técnica y funcional en el README.
