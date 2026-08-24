@@ -1,3 +1,5 @@
 
 materiales
 .venv
+__pycache__/
+*.pyc
