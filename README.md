@@ -438,3 +438,55 @@ Las pruebas mockean el cliente de Anthropic: corren sin red y sin
 necesidad de `ANTHROPIC_API_KEY`. Cubren clasificación exitosa, éxito tras
 un reintento, agotamiento de reintentos → degradado, y falta de API key →
 `ConfiguracionInvalida`.
+
+---
+
+# Corrección de defectos en `legacy_module.py`
+
+> Ver `specs/03-correccion-legacy-module.md` para el spec completo. El
+> código de `materiales/` no se versiona en este repo (está en
+> `.gitignore`); este reporte deja constancia de la corrección aplicada.
+
+## Reporte de causa raíz
+
+El módulo heredado de la Mesa de Ayuda (`materiales/legacy/legacy_module.py`)
+presentaba tres defectos de lógica, cada uno asociado a un síntoma
+reportado por el área pero nunca diagnosticado:
+
+| Síntoma | Función | Causa raíz | Fix |
+| ------- | ------- | ---------- | --- |
+| **S1** — el informe mensual pierde tickets | `filtrar_por_periodo` | Comparación estricta (`fc > inicio and fc < fin`) excluía los tickets creados exactamente en los extremos del periodo, pese a que el periodo debe incluirlos. | `fc >= inicio and fc <= fin` |
+| **S2** — cifras infladas en resúmenes sucesivos | `resumir_por_area` | `acumulador={}` es un diccionario mutable evaluado una sola vez al definir la función, por lo que persiste y se acumula entre llamadas sucesivas dentro del mismo proceso. | `acumulador=None` con inicialización `{}` dentro del cuerpo |
+| **S3** — reaperturas subcontadas | `contar_reaperturas` | Comparaba el `estado` actual contra `"reabierto"` de forma exacta, ignorando variantes de mayúsculas y tickets reabiertos-y-cerrados de nuevo (cuyo `estado` ya no es `"reabierto"` aunque `reaperturas > 0`). | Contar `int(t.get("reaperturas") or 0) > 0`, usando el campo autoritativo en vez del `estado` |
+
+Cada fix quedó acompañado de un comentario de una línea en el código con
+esta misma causa raíz, y ninguna función ajena a S1/S2/S3 cambió de
+comportamiento.
+
+## Pruebas
+
+`materiales/legacy/tests/test_legacy_module.py` agrega una prueba pytest
+por síntoma, con datos sintéticos definidos en el propio archivo (no
+depende del CSV de 2000 filas):
+
+- `test_filtrar_por_periodo_incluye_extremos`
+- `test_resumir_por_area_no_acumula_entre_llamadas`
+- `test_contar_reaperturas_usa_campo_reaperturas`
+
+Las tres se verificaron en rojo→verde: cada una falla si se revierte
+únicamente su fix correspondiente, y las tres pasan contra el código
+corregido.
+
+```bash
+.venv/bin/pytest materiales/legacy/tests/ -v
+```
+
+Salida esperada:
+
+```
+materiales/legacy/tests/test_legacy_module.py::test_filtrar_por_periodo_incluye_extremos PASSED
+materiales/legacy/tests/test_legacy_module.py::test_resumir_por_area_no_acumula_entre_llamadas PASSED
+materiales/legacy/tests/test_legacy_module.py::test_contar_reaperturas_usa_campo_reaperturas PASSED
+
+============================== 3 passed in 0.01s ===============================
+```
